@@ -7,6 +7,8 @@
 #include <cassert>
 #include <cstring>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
 
 typedef std::uint32_t u32;
 typedef std::int32_t  i32;
@@ -188,16 +190,15 @@ aku_Status SeriesParser::to_normal_form(const char* begin, const char* end,
     return AKU_SUCCESS;
 }
 
-
-//                //
-//  Posting list  //
-//                //
+//                       //
+//      String Pool      //
+//                       //
 
 typedef std::pair<const char*, u32> StringT;
 
 class StringPool {
 public:
-    const int MAX_BIN_SIZE = 1 << 21;
+    const u64 MAX_BIN_SIZE = AKU_LIMITS_MAX_SNAME * 0x1000;  // 8Mb
 
     std::deque<std::vector<char>> pool;
     mutable std::mutex            pool_mutex;
@@ -224,13 +225,11 @@ public:
 
     //! Get number of stored strings atomically
     size_t size() const;
+
+    size_t mem_used() const;
 };
 
-//                       //
-//      String Pool      //
-//                       //
-
-static u64 splitBits(u32 val) {
+u64 splitBits(u32 val) {
     u64 x = val & 0x1fffff;
     x = (x | x << 32) & 0x001f00000000ffff;
     x = (x | x << 16) & 0x001f0000ff0000ff;
@@ -240,7 +239,7 @@ static u64 splitBits(u32 val) {
     return x;
 }
 
-static u32 compactBits(u64 x) {
+u32 compactBits(u64 x) {
     x &= 0x1249249249249249;
     x = (x ^ (x >> 2)) & 0x10c30c30c30c30c3;
     x = (x ^ (x >> 4)) & 0x100f00f00f00f00f;
@@ -250,15 +249,15 @@ static u32 compactBits(u64 x) {
     return static_cast<u32>(x);
 }
 
-static u64 encodeZorder(u32 x, u32 y) {
+u64 encodeZorder(u32 x, u32 y) {
     return splitBits(x) | (splitBits(y) << 1);
 }
 
-static u32 decodeZorderX(u64 bits) {
+u32 decodeZorderX(u64 bits) {
     return compactBits(bits);
 }
 
-static u32 decodeZorderY(u64 bits) {
+u32 decodeZorderY(u64 bits) {
     return compactBits(bits >> 1);
 }
 
@@ -268,23 +267,24 @@ StringPool::StringPool()
 }
 
 u64 StringPool::add(const char* begin, const char* end) {
+    assert(begin < end);
     std::lock_guard<std::mutex> guard(pool_mutex);
     if (pool.empty()) {
         pool.emplace_back();
-        pool.back().reserve(static_cast<size_t>(MAX_BIN_SIZE));
+        pool.back().reserve(MAX_BIN_SIZE);
     }
-    int size = static_cast<int>(end - begin);
+    auto size = static_cast<u64>(end - begin);
     if (size == 0) {
         return 0;
     }
     size += 1;  // 1 is for 0 character
     u32 bin_index = static_cast<u32>(pool.size()); // bin index is 1-based
     std::vector<char>* bin = &pool.back();
-    if (static_cast<int>(bin->size()) + size > MAX_BIN_SIZE) {
+    if (bin->size() + size > MAX_BIN_SIZE) {
         // New bin
         pool.emplace_back();
         bin = &pool.back();
-        bin->reserve(static_cast<size_t>(MAX_BIN_SIZE));
+        bin->reserve(MAX_BIN_SIZE);
         bin_index = static_cast<u32>(pool.size());
     }
     u32 offset = static_cast<u32>(bin->size()); // offset is 0-based
@@ -293,12 +293,12 @@ u64 StringPool::add(const char* begin, const char* end) {
     }
     bin->push_back('\0');
     std::atomic_fetch_add(&counter, 1ul);
-    return encodeZorder(bin_index, offset);
+    return bin_index*MAX_BIN_SIZE + offset;
 }
 
 StringT StringPool::str(u64 bits) {
-    u32 ix     = decodeZorderX(bits);
-    u32 offset = decodeZorderY(bits);
+    u64 ix     = bits / MAX_BIN_SIZE;
+    u64 offset = bits % MAX_BIN_SIZE;
     std::lock_guard<std::mutex> guard(pool_mutex);
     if (ix < pool.size()) {
         std::vector<char>* bin = &pool.at(ix);
@@ -314,16 +314,116 @@ size_t StringPool::size() const {
     return std::atomic_load(&counter);
 }
 
+size_t StringPool::mem_used() const {
+    size_t res = 0;
+    std::lock_guard<std::mutex> guard(pool_mutex);
+    for (auto const& bin: pool) {
+        res += bin.size();
+    }
+    return res;
+}
+
+
+//               //
+//  StringTools  //
+//               //
+
+struct StringTools {
+    static size_t hash(StringT str);
+    static bool equal(StringT lhs, StringT rhs);
+
+    typedef std::unordered_map<StringT, u64, decltype(&StringTools::hash),
+                               decltype(&StringTools::equal)>
+        TableT;
+
+    typedef std::unordered_set<StringT, decltype(&StringTools::hash), decltype(&StringTools::equal)>
+        SetT;
+
+    //! Inverted table type (id to string mapping)
+    typedef std::unordered_map<u64, StringT> InvT;
+
+    static TableT create_table(size_t size);
+
+static SetT create_set(size_t size);
+};
+
+size_t StringTools::hash(StringT str) {
+    // implementation of Dan Bernstein's djb2
+    const char* begin = str.first;
+    int len = str.second;
+    const char* end = begin + len;
+    size_t hash = 5381;
+    size_t c;
+    while (begin < end) {
+        c = static_cast<size_t>(*begin++);
+        hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+    }
+    return hash;
+}
+
+bool StringTools::equal(StringT lhs, StringT rhs) {
+    if (lhs.second != rhs.second) {
+        return false;
+    }
+    return std::equal(lhs.first, lhs.first + lhs.second, rhs.first);
+}
+
+StringTools::TableT StringTools::create_table(size_t size) {
+    return TableT(size, &StringTools::hash, &StringTools::equal);
+}
+
+StringTools::SetT StringTools::create_set(size_t size) {
+    return SetT(size, &StringTools::hash, &StringTools::equal);
+}
+
+//             //
+//  CM-sketch  //
+//             //
+
+class CMSketch {
+
+};
+
+//               //
+//  PostingList  //
+//               //
+
 /**
  * @brief The PostingList class can be used to read and write posting lists
  */
 class PostingList {
+
 };
+
+
 
 int main(int argc, char *argv[])
 {
+    StringPool pool;
+    StringTools::TableT table = StringTools::create_table(100000);
+    StringTools::InvT inv_tab;
+    char buffer[0x1000];
     for (std::string line; std::getline(std::cin, line);) {
-        std::cout << "line: " << line << std::endl;
+        const char* tags_begin;
+        const char* tags_end;
+        auto status = SeriesParser::to_normal_form(line.data(), line.data() + line.size(), buffer, buffer + 0x1000, &tags_begin, &tags_end);
+        if (status != AKU_SUCCESS) {
+            std::cout << "error: " << status << std::endl;
+            std::cout << "line: " << line << std::endl;
+            std::abort();
+        }
+        auto name = std::make_pair((const char*)buffer, tags_end - buffer);
+        if (table.count(name) == 0) {
+            auto id = pool.add(buffer, tags_end);
+            if (id == 0) {
+                std::cout << "can't add string \"" << line << "\"" << std::endl;
+                std::abort();
+            }
+            name = pool.str(id);  // name now have the same lifetime as pool
+            table[name] = id;
+        }
     }
+    std::cout << "number of unique series: " << table.size() << std::endl;
+    std::cout << "string pool size: " << pool.size() << " lines, " << pool.mem_used() << " bytes" << std::endl;
     return 0;
 }

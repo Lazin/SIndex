@@ -9,6 +9,12 @@
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <ctime>
+
+#include "roaring.hh"
+#include "roaring64map.hh"
+
+#define BOOST_THROW_EXCEPTION(x) throw x;
 
 typedef std::uint32_t u32;
 typedef std::int32_t  i32;
@@ -299,9 +305,10 @@ u64 StringPool::add(const char* begin, const char* end) {
 StringT StringPool::str(u64 bits) {
     u64 ix     = bits / MAX_BIN_SIZE;
     u64 offset = bits % MAX_BIN_SIZE;
+    assert(ix != 0);
     std::lock_guard<std::mutex> guard(pool_mutex);
-    if (ix < pool.size()) {
-        std::vector<char>* bin = &pool.at(ix);
+    if (ix <= pool.size()) {
+        std::vector<char>* bin = &pool.at(ix - 1);
         if (offset < bin->size()) {
             const char* pstr = bin->data() + offset;
             return std::make_pair(pstr, std::strlen(pstr));
@@ -376,12 +383,126 @@ StringTools::SetT StringTools::create_set(size_t size) {
     return SetT(size, &StringTools::hash, &StringTools::equal);
 }
 
+//                  //
+//  Hash-fn family  //
+//                  //
+
+//! Family of 4-universal hash functions
+struct HashFnFamily {
+    const u32 N;
+    const u32 K;
+    //! Tabulation based hash fn used, N tables should be generated using RNG in c-tor
+    std::vector<std::vector<unsigned short>> table_;
+
+    //! C-tor. N - number of different hash functions, K - number of values (should be a power of two)
+    HashFnFamily(u32 N, u32 K);
+
+    //! Calculate hash value in range [0, K)
+    u32 hash(int ix, u64 key) const;
+
+private:
+    u32 hash32(int ix, u32 key) const;
+};
+
+static u32 combine(u32 hi, u32 lo) {
+    return (u32)(2 - (int)hi + (int)lo);
+}
+
+HashFnFamily::HashFnFamily(u32 N, u32 K)
+    : N(N)
+    , K(K)
+{
+    // N should be odd
+    if (N % 2 == 0) {
+        std::runtime_error err("invalid argument N (should be odd)");
+        BOOST_THROW_EXCEPTION(err);
+    }
+    // K should be a power of two
+    auto mask = K-1;
+    if ((mask&K) != 0) {
+        std::runtime_error err("invalid argument K (should be a power of two)");
+        BOOST_THROW_EXCEPTION(err);
+    }
+    // Generate tables
+    std::random_device randdev;
+    std::mt19937 generator(randdev());
+    std::uniform_int_distribution<> distribution;
+    for (u32 i = 0; i < N; i++) {
+        std::vector<unsigned short> col;
+        auto mask = K-1;
+        for (int j = 0; j < 0x10000; j++) {
+            int value = distribution(generator);
+            col.push_back((u32)mask&value);
+        }
+        table_.push_back(col);
+    }
+}
+
+u32 HashFnFamily::hash(int ix, u64 key) const {
+    auto hi32 = key >> 32;
+    auto lo32 = key & 0xFFFFFFFF;
+    auto hilo = combine(hi32, lo32);
+
+    auto hi32hash = hash32(ix, hi32);
+    auto lo32hash = hash32(ix, lo32);
+    auto hilohash = hash32(ix, hilo);
+
+    return hi32hash ^ lo32hash ^ hilohash;
+}
+
+u32 HashFnFamily::hash32(int ix, u32 key) const {
+    auto hi16 = key >> 16;
+    auto lo16 = key & 0xFFFF;
+    auto hilo = combine(hi16, lo16) & 0xFFFF;
+    return table_[ix][lo16] ^ table_[ix][hi16] ^ table_[ix][hilo];
+}
+
 //             //
 //  CM-sketch  //
 //             //
 
+//template<class TVal=Roaring>
 class CMSketch {
+    typedef Roaring TVal;
+    std::vector<std::vector<TVal>> table_;
+    HashFnFamily hashfn_;
+    const u32 N;
+    const u32 M;
+public:
+    CMSketch(u32 N, u32 M) : hashfn_(N, M), N(N), M(M) {
+        table_.resize(N);
+        for (auto& row: table_) {
+            row.resize(M);
+        }
+    }
 
+    void add(u64 value) {
+        for (u32 i = 0; i < N; i++) {
+            // calculate hash from id to K
+            u32 hash = hashfn_.hash(i, value);
+            table_[i][hash].add((u32)value);
+        }
+    }
+
+    size_t get_size_in_bytes() const {
+        size_t sum = 0;
+        for (auto const& row: table_) {
+            for (auto const& bmp: row) {
+                sum += bmp.getSizeInBytes();
+            }
+        }
+        return sum;
+    }
+
+    Roaring extract(u64 value) {
+        std::vector<const Roaring*> inputs;
+        for (u32 i = 0; i < N; i++) {
+            // calculate hash from id to K
+            u32 hash = hashfn_.hash(i, value);
+            inputs.push_back(&table_[i][hash]);
+        }
+        return *inputs[0] & *inputs[1] & *inputs[2];
+    }
 };
 
 //               //
@@ -395,14 +516,90 @@ class PostingList {
 
 };
 
+std::vector<std::string> sample_lines = {
+    "cpu.user OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "cpu.sys OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "cpu.real OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "idle OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "mem.commit OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "mem.virt OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "iops OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "tcp.packets.in OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "tcp.packets.out OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "tcp.ret OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
+    "cpu.user OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "cpu.sys OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "cpu.real OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "idle OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "mem.commit OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "mem.virt OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "iops OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "tcp.packets.in OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "tcp.packets.out OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "tcp.ret OS=Ubuntu_16.04 arch=x64 host=192.168.0.1 instance-type=m4.2xlarge rack=96 region=eu-central-1 team=NJ",
+    "cpu.user OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "cpu.sys OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "cpu.real OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "idle OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "mem.commit OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "mem.virt OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "iops OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "tcp.packets.in OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "tcp.packets.out OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "tcp.ret OS=Ubuntu_14.04 arch=x64 host=192.168.0.2 instance-type=m4.large rack=90 region=eu-central-1 team=NJ",
+    "cpu.user OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "cpu.sys OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "cpu.real OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "idle OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "mem.commit OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "mem.virt OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "iops OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "tcp.packets.in OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "tcp.packets.out OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "tcp.ret OS=Ubuntu_16.04 arch=x64 host=192.168.0.3 instance-type=m4.2xlarge rack=77 region=us-east-1 team=NJ",
+    "cpu.user OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+    "cpu.sys OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+    "cpu.real OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+    "idle OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+    "mem.commit OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+    "mem.virt OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+    "iops OS=Ubuntu_14.04 arch=x64 host=192.168.0.4 instance-type=m3.large rack=63 region=us-east-1 team=NY",
+};
 
+class PerfTimer {
+public:
+    PerfTimer();
+    void   restart();
+    double elapsed() const;
+
+private:
+    timespec _start_time;
+};
+
+PerfTimer::PerfTimer() {
+    clock_gettime(CLOCK_MONOTONIC_RAW, &_start_time);
+}
+
+void PerfTimer::restart() {
+    clock_gettime(CLOCK_MONOTONIC_RAW, &_start_time);
+}
+
+double PerfTimer::elapsed() const {
+    timespec curr;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &curr);
+    return double(curr.tv_sec - _start_time.tv_sec) +
+           double(curr.tv_nsec - _start_time.tv_nsec)/1000000000.0;
+}
 
 int main(int argc, char *argv[])
 {
     StringPool pool;
     StringTools::TableT table = StringTools::create_table(100000);
     StringTools::InvT inv_tab;
+    CMSketch sketch(3, 1024);
     char buffer[0x1000];
+    std::vector<u64> samples;
+    //for (auto line: sample_lines) {
     for (std::string line; std::getline(std::cin, line);) {
         const char* tags_begin;
         const char* tags_end;
@@ -419,11 +616,28 @@ int main(int argc, char *argv[])
                 std::cout << "can't add string \"" << line << "\"" << std::endl;
                 std::abort();
             }
+            if (samples.size() < 10) {
+                samples.push_back(id);
+            }
             name = pool.str(id);  // name now have the same lifetime as pool
             table[name] = id;
+            sketch.add(id);
         }
     }
     std::cout << "number of unique series: " << table.size() << std::endl;
     std::cout << "string pool size: " << pool.size() << " lines, " << pool.mem_used() << " bytes" << std::endl;
+    std::cout << "bitmap index size: " << sketch.get_size_in_bytes() << " bytes" << std::endl;
+    // Try to extract by id
+    for (auto id: samples) {
+        PerfTimer tm;
+        Roaring out = sketch.extract(id);
+        double elapsed = tm.elapsed();
+        std::cout << "searching for id: " << id << std::endl;
+        std::cout << "out size = " << out.cardinality() << std::endl;
+        for (auto it = out.begin(); it != out.end(); it++) {
+            std::cout << "id - " << (*it) << std::endl;
+        }
+        std::cout << "elapsed: " << elapsed << std::endl;
+    }
     return 0;
 }

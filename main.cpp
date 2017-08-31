@@ -461,9 +461,35 @@ u32 HashFnFamily::hash32(int ix, u32 key) const {
 //  CM-sketch  //
 //             //
 
+class PList {
+    std::vector<u64> lst_;
+public:
+    void add(u64 x) { lst_.push_back(x); }
+    size_t getSizeInBytes() const {
+        return lst_.capacity() * sizeof(u64);
+    }
+
+    PList operator & (PList const& other) const {
+        PList result;
+        std::set_intersection(lst_.begin(), lst_.end(), other.lst_.begin(), other.lst_.end(),
+                              std::back_inserter(result.lst_));
+        return result;
+    }
+    size_t cardinality() const {
+        return lst_.size();
+    }
+    std::vector<u64>::const_iterator begin() const {
+        return lst_.begin();
+    }
+    std::vector<u64>::const_iterator end() const {
+        return lst_.end();
+    }
+};
+
 //template<class TVal=Roaring>
 class CMSketch {
-    typedef Roaring TVal;
+    //typedef Roaring TVal;
+    typedef PList TVal;
     std::vector<std::vector<TVal>> table_;
     HashFnFamily hashfn_;
     const u32 N;
@@ -494,8 +520,8 @@ public:
         return sum;
     }
 
-    Roaring extract(u64 value) {
-        std::vector<const Roaring*> inputs;
+    TVal extract(u64 value) {
+        std::vector<const TVal*> inputs;
         for (u32 i = 0; i < N; i++) {
             // calculate hash from id to K
             u32 hash = hashfn_.hash(i, value);
@@ -628,9 +654,10 @@ int main(int argc, char *argv[])
     std::cout << "string pool size: " << pool.size() << " lines, " << pool.mem_used() << " bytes" << std::endl;
     std::cout << "bitmap index size: " << sketch.get_size_in_bytes() << " bytes" << std::endl;
     // Try to extract by id
+
     for (auto id: samples) {
         PerfTimer tm;
-        Roaring out = sketch.extract(id);
+        auto out = sketch.extract(id);
         double elapsed = tm.elapsed();
         std::cout << "searching for id: " << id << std::endl;
         std::cout << "out size = " << out.cardinality() << std::endl;
@@ -639,5 +666,6 @@ int main(int argc, char *argv[])
         }
         std::cout << "elapsed: " << elapsed << std::endl;
     }
+
     return 0;
 }

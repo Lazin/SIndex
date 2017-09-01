@@ -961,7 +961,8 @@ int main(int argc, char *argv[])
     }
     std::cout << "number of unique series: " << table.size() << std::endl;
     std::cout << "string pool size: " << pool.size() << " lines, " << pool.mem_used() << " bytes" << std::endl;
-    std::cout << "bitmap index size: " << metrics_sketch.get_size_in_bytes() << " bytes" << std::endl;
+    std::cout << "metric index size: " << metrics_sketch.get_size_in_bytes() << " bytes" << std::endl;
+    std::cout << "tags index size: " << tagpair_sketch.get_size_in_bytes() << " bytes" << std::endl;
 
     // Try to extract by id
     for (auto id: samples) {

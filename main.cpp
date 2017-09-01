@@ -861,16 +861,6 @@ public:
     }
 };
 
-//               //
-//  PostingList  //
-//               //
-
-/**
- * @brief The PostingList class can be used to read and write posting lists
- */
-class PostingList {
-
-};
 
 std::vector<std::string> sample_lines = {
     "cpu.user OS=Ubuntu_14.04 arch=x64 host=192.168.0.0 instance-type=m3.large rack=86 region=eu-central-1 team=NJ",
@@ -965,6 +955,49 @@ void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 i
         std::abort();
     }
 }
+
+class Index {
+    StringPool pool_;
+    StringTools::TableT table_;
+    CMSketch metrics_names_;
+    CMSketch tagvalue_pairs_;
+public:
+    Index()
+        : table_(StringTools::create_table(100000))
+        , metrics_names_(3, 1024)
+        , tagvalue_pairs_(3, 1024)
+    {
+    }
+
+    aku_Status append(const char* begin, const char* end) {
+        // Parse string value and sort tags alphabetically
+        const char* tags_begin;
+        const char* tags_end;
+        char buffer[0x1000];
+        auto status = SeriesParser::to_normal_form(begin, end, buffer, buffer + 0x1000, &tags_begin, &tags_end);
+        if (status != AKU_SUCCESS) {
+            std::string line(begin, end);
+            std::cout << "error: " << status << std::endl;
+            std::cout << "line: " << line << std::endl;
+            return AKU_EBAD_ARG;
+        }
+        // Check if name is already been added
+        auto name = std::make_pair((const char*)buffer, tags_end - buffer);
+        if (table_.count(name) == 0) {
+            auto id = pool_.add(buffer, tags_end);
+            if (id == 0) {
+                std::string line(begin, end);
+                std::cout << "can't add string \"" << line << "\"" << std::endl;
+                return AKU_EBAD_DATA;
+            }
+            write_tags(tags_begin, tags_end, &tagvalue_pairs_, id);
+            name = pool_.str(id);  // name now have the same lifetime as pool
+            table_[name] = id;
+            metrics_names_.add(id);
+        }
+        return AKU_SUCCESS;
+    }
+};
 
 int main(int argc, char *argv[])
 {

@@ -461,6 +461,286 @@ u32 HashFnFamily::hash32(int ix, u32 key) const {
 //  CM-sketch  //
 //             //
 
+namespace {
+//! Base 128 encoded integer
+template <class TVal> class Base128Int {
+    TVal                  value_;
+    typedef unsigned char byte_t;
+    typedef byte_t*       byte_ptr;
+
+public:
+    Base128Int(TVal val)
+        : value_(val) {}
+
+    Base128Int()
+        : value_() {}
+
+    /** Read base 128 encoded integer from the binary stream
+      * FwdIter - forward iterator.
+      */
+    const unsigned char* get(const unsigned char* begin, const unsigned char* end) {
+        assert(begin < end);
+
+        auto                 acc = TVal();
+        auto                 cnt = TVal();
+        const unsigned char* p   = begin;
+
+        while (true) {
+            if (p == end) {
+                return begin;
+            }
+            auto i = static_cast<byte_t>(*p & 0x7F);
+            acc |= TVal(i) << cnt;
+            if ((*p++ & 0x80) == 0) {
+                break;
+            }
+            cnt += 7;
+        }
+        value_ = acc;
+        return p;
+    }
+
+    /** Write base 128 encoded integer to the binary stream.
+      * @returns 'begin' on error, iterator to next free region otherwise
+      */
+    void put(std::vector<char>& vec) const {
+        TVal           value = value_;
+        unsigned char p;
+        while (true) {
+            p = value & 0x7F;
+            value >>= 7;
+            if (value != 0) {
+                p |= 0x80;
+                vec.push_back(static_cast<char>(p));
+            } else {
+                vec.push_back(static_cast<char>(p));
+                break;
+            }
+        }
+    }
+
+    //! turn into integer
+    operator TVal() const { return value_; }
+};
+
+//! Base128 encoder
+struct Base128StreamWriter {
+    // underlying memory region
+    std::vector<char>* buffer_;
+
+    Base128StreamWriter(std::vector<char>& buffer)
+        : buffer_(&buffer)
+    {}
+
+//    Base128StreamWriter(Base128StreamWriter& other)
+//        : buffer_(other.buffer_)
+//    {}
+    Base128StreamWriter(Base128StreamWriter const& other) = delete;
+    Base128StreamWriter& operator = (Base128StreamWriter const& other) = delete;
+
+    void reset(std::vector<char>& buffer) {
+        buffer_ = &buffer;
+    }
+
+    bool empty() const { return buffer_->empty(); }
+
+    //! Put value into stream.
+    template <class TVal> bool put(TVal value) {
+        Base128Int<TVal> val(value);
+        val.put(*buffer_);
+        return true;
+    }
+};
+
+//! Base128 decoder
+struct Base128StreamReader {
+    const unsigned char* pos_;
+    const unsigned char* end_;
+
+    Base128StreamReader(const unsigned char* begin, const unsigned char* end)
+        : pos_(begin)
+        , end_(end) {}
+
+    template <class TVal> TVal next() {
+        Base128Int<TVal> value;
+        auto             p = value.get(pos_, end_);
+        if (p == pos_) {
+            std::terminate();
+        }
+        pos_ = p;
+        return static_cast<TVal>(value);
+    }
+};
+
+template <class Stream, typename TVal> struct DeltaStreamWriter {
+    Stream& stream_;
+    TVal   prev_;
+
+    template<class Substream>
+    DeltaStreamWriter(Substream& stream)
+        : stream_(stream)
+        , prev_{}
+    {}
+
+    bool put(TVal value) {
+        auto result = stream_.put(static_cast<TVal>(value) - prev_);
+        prev_       = value;
+        return result;
+    }
+};
+
+
+template <class Stream, typename TVal> struct DeltaStreamReader {
+    Stream& stream_;
+    TVal   prev_;
+
+    template<class Substream>
+    DeltaStreamReader(Substream& stream)
+        : stream_(stream)
+        , prev_() {}
+
+    TVal next() {
+        TVal delta = stream_.template next<TVal>();
+        TVal value = prev_ + delta;
+        prev_      = value;
+        return value;
+    }
+};
+
+}
+
+
+class CompressedPList {
+    std::vector<char> buffer_;
+    Base128StreamWriter writer_;
+    DeltaStreamWriter<Base128StreamWriter, u64> delta_;
+    size_t cardinality_;
+public:
+
+    typedef u64 value_type;
+
+    CompressedPList()
+        : writer_(buffer_)
+        , delta_(writer_)
+        , cardinality_(0)
+    {
+    }
+
+    CompressedPList(CompressedPList const& other)
+        : buffer_(other.buffer_)
+        , writer_(buffer_)
+        , delta_(writer_)
+        , cardinality_(other.cardinality_)
+    {
+        assert(buffer_.size());
+    }
+
+    CompressedPList(CompressedPList && other)
+        : buffer_(std::move(other.buffer_))
+        , writer_(buffer_)
+        , delta_(writer_)
+        , cardinality_(other.cardinality_)
+    {
+        assert(buffer_.size());
+    }
+
+    CompressedPList& operator = (CompressedPList const& other) = delete;
+//        buffer_ = other.buffer_;
+//        cardinality_ = other.cardinality_;
+//        writer_.reset(buffer_);
+//        assert(buffer_.size());
+//        return *this;
+//    }
+
+    void add(u64 x) {
+        //writer_.put(x);
+        delta_.put(x);
+        cardinality_++;
+    }
+
+    void push_back(u64 x) {
+        add(x);
+    }
+
+    size_t getSizeInBytes() const {
+        return buffer_.capacity();
+    }
+
+    size_t cardinality() const {
+        return cardinality_;
+    }
+
+    CompressedPList operator & (CompressedPList const& other) const {
+        CompressedPList result;
+        std::set_intersection(begin(), end(), other.begin(), other.end(),
+                              std::back_inserter(result));
+        return result;
+    }
+
+    // Iteration
+
+    class const_iterator {
+        size_t card_;
+        Base128StreamReader reader_;
+        DeltaStreamReader<Base128StreamReader, u64> delta_;
+        size_t pos_;
+        u64 curr_;
+    public:
+        const_iterator(std::vector<char> const& vec, size_t c)
+            : card_(c)
+            , reader_(reinterpret_cast<const unsigned char*>(vec.data()),
+                      reinterpret_cast<const unsigned char*>(vec.data() + vec.size()))
+            , delta_(reader_)
+            , pos_(0)
+        {
+            //curr_ = reader_.next<u64>();
+            curr_ = delta_.next();
+        }
+
+        /**
+         * @brief Create iterator pointing to the end of the sequence
+         */
+        const_iterator(std::vector<char> const& vec, size_t c, bool)
+            : card_(c)
+            , reader_(reinterpret_cast<const unsigned char*>(vec.data()),
+                      reinterpret_cast<const unsigned char*>(vec.data() + vec.size()))
+            , delta_(reader_)
+            , pos_(c)
+            , curr_()
+        {
+        }
+
+        u64 operator * () const {
+            return curr_;
+        }
+
+        const_iterator& operator ++ () {
+            pos_++;
+            if (pos_ != card_) {
+                //curr_ = reader_.next<u64>();
+                curr_ = delta_.next();
+            }
+            return *this;
+        }
+
+        bool operator == (const_iterator const& other) const {
+            return pos_ == other.pos_;
+        }
+
+        bool operator != (const_iterator const& other) const {
+            return pos_ != other.pos_;
+        }
+    };
+
+    const_iterator begin() const {
+        return const_iterator(buffer_, cardinality_);
+    }
+
+    const_iterator end() const {
+        return const_iterator(buffer_, cardinality_, false);
+    }
+};
+
 class PList {
     std::vector<u64> lst_;
 public:
@@ -486,10 +766,10 @@ public:
     }
 };
 
-//template<class TVal=Roaring>
 class CMSketch {
     //typedef Roaring TVal;
-    typedef PList TVal;
+    //typedef PList TVal;
+    typedef CompressedPList TVal;
     std::vector<std::vector<TVal>> table_;
     HashFnFamily hashfn_;
     const u32 N;
@@ -507,6 +787,14 @@ public:
             // calculate hash from id to K
             u32 hash = hashfn_.hash(i, value);
             table_[i][hash].add((u32)value);
+        }
+    }
+
+    void add(u64 key, u64 value) {
+        for (u32 i = 0; i < N; i++) {
+            // calculate hash from id to K
+            u32 hash = hashfn_.hash(i, key);
+            table_[i][hash].add(value);
         }
     }
 
@@ -617,12 +905,32 @@ double PerfTimer::elapsed() const {
            double(curr.tv_nsec - _start_time.tv_nsec)/1000000000.0;
 }
 
+void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 id) {
+    const char* tag_begin = begin;
+    const char* tag_end = begin;
+    bool err = false;
+    while(!err && tag_begin != end) {
+        tag_begin = skip_space(tag_begin, end);
+        tag_end = tag_begin;
+        tag_end = skip_tag(tag_end, end, &err);
+        auto tagpair = std::make_pair(tag_begin, static_cast<u32>(tag_end - tag_begin));
+        u64 hash = StringTools::hash(tagpair);
+        dest_sketch->add(hash, id);
+        tag_begin = tag_end;
+    }
+    if (err) {
+        std::cerr << "Failure" << std::endl;
+        std::abort();
+    }
+}
+
 int main(int argc, char *argv[])
 {
     StringPool pool;
     StringTools::TableT table = StringTools::create_table(100000);
     StringTools::InvT inv_tab;
-    CMSketch sketch(3, 1024);
+    CMSketch metrics_sketch(3, 1024);
+    CMSketch tagpair_sketch(3, 1024);
     char buffer[0x1000];
     std::vector<u64> samples;
     //for (auto line: sample_lines) {
@@ -645,27 +953,44 @@ int main(int argc, char *argv[])
             if (samples.size() < 10) {
                 samples.push_back(id);
             }
+            write_tags(tags_begin, tags_end, &tagpair_sketch, id);
             name = pool.str(id);  // name now have the same lifetime as pool
             table[name] = id;
-            sketch.add(id);
+            metrics_sketch.add(id);
         }
     }
     std::cout << "number of unique series: " << table.size() << std::endl;
     std::cout << "string pool size: " << pool.size() << " lines, " << pool.mem_used() << " bytes" << std::endl;
-    std::cout << "bitmap index size: " << sketch.get_size_in_bytes() << " bytes" << std::endl;
-    // Try to extract by id
+    std::cout << "bitmap index size: " << metrics_sketch.get_size_in_bytes() << " bytes" << std::endl;
 
+    // Try to extract by id
     for (auto id: samples) {
         PerfTimer tm;
-        auto out = sketch.extract(id);
+        auto out = metrics_sketch.extract(id);
         double elapsed = tm.elapsed();
         std::cout << "searching for id: " << id << std::endl;
         std::cout << "out size = " << out.cardinality() << std::endl;
-        for (auto it = out.begin(); it != out.end(); it++) {
+        for (auto it = out.begin(); it != out.end(); ++it) {
             std::cout << "id - " << (*it) << std::endl;
         }
         std::cout << "elapsed: " << elapsed << std::endl;
     }
 
+    // Try to extract by tag combination
+    PerfTimer tm2;
+    const char* tag_host = "host=192.168.0.3";
+    const char* tag_inst = "instance-type=m4.2xlarge";
+    u64 hash_host = StringTools::hash(std::make_pair(tag_host, strlen(tag_host)));
+    u64 hash_inst = StringTools::hash(std::make_pair(tag_inst, strlen(tag_inst)));
+    auto plist_host = tagpair_sketch.extract(hash_host);
+    auto plist_inst = tagpair_sketch.extract(hash_inst);
+    auto plist_final = plist_host & plist_inst;
+    double elapsed = tm2.elapsed();
+    std::cout << "Tag combination extracted, time: " << (elapsed*1000000.0) << " usec" << std::endl;
+    for (auto it = plist_final.begin(); it != plist_final.end(); ++it) {
+        auto id = *it;
+        auto sname = pool.str(id);
+        std::cout << "Name found: " << std::string(sname.first, sname.first + sname.second) << std::endl;
+    }
     return 0;
 }

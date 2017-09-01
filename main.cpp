@@ -10,9 +10,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <ctime>
-
-#include "roaring.hh"
-#include "roaring64map.hh"
+#include <vector>
+#include <random>
 
 #define BOOST_THROW_EXCEPTION(x) throw x;
 
@@ -561,10 +560,25 @@ struct Base128StreamReader {
         : pos_(begin)
         , end_(end) {}
 
+    Base128StreamReader(Base128StreamReader const& other)
+        : pos_(other.pos_)
+        , end_(other.end_)
+    {
+    }
+
+    Base128StreamReader& operator = (Base128StreamReader const& other) {
+        if (&other == this) {
+            return *this;
+        }
+        pos_ = other.pos_;
+        end_ = other.end_;
+    }
+
     template <class TVal> TVal next() {
         Base128Int<TVal> value;
         auto             p = value.get(pos_, end_);
         if (p == pos_) {
+            std::cerr << "Base128Stream read error" << std::endl;
             std::terminate();
         }
         pos_ = p;
@@ -591,16 +605,30 @@ template <class Stream, typename TVal> struct DeltaStreamWriter {
 
 
 template <class Stream, typename TVal> struct DeltaStreamReader {
-    Stream& stream_;
+    Stream* stream_;
     TVal   prev_;
 
-    template<class Substream>
-    DeltaStreamReader(Substream& stream)
-        : stream_(stream)
+    DeltaStreamReader(Stream& stream)
+        : stream_(&stream)
         , prev_() {}
 
+    DeltaStreamReader(DeltaStreamReader const& other)
+        : stream_(other.stream_)
+        , prev_(other.prev_)
+    {
+    }
+
+    DeltaStreamReader& operator = (DeltaStreamReader const& other) {
+        if (&other == this) {
+            return *this;
+        }
+        stream_ = other.stream_;
+        prev_   = other.prev_;
+        return *this;
+    }
+
     TVal next() {
-        TVal delta = stream_.template next<TVal>();
+        TVal delta = stream_->template next<TVal>();
         TVal value = prev_ + delta;
         prev_      = value;
         return value;
@@ -645,15 +673,8 @@ public:
     }
 
     CompressedPList& operator = (CompressedPList const& other) = delete;
-//        buffer_ = other.buffer_;
-//        cardinality_ = other.cardinality_;
-//        writer_.reset(buffer_);
-//        assert(buffer_.size());
-//        return *this;
-//    }
 
     void add(u64 x) {
-        //writer_.put(x);
         delta_.put(x);
         cardinality_++;
     }
@@ -693,8 +714,9 @@ public:
             , delta_(reader_)
             , pos_(0)
         {
-            //curr_ = reader_.next<u64>();
-            curr_ = delta_.next();
+            if (pos_ < card_) {
+                curr_ = delta_.next();
+            }
         }
 
         /**
@@ -710,14 +732,34 @@ public:
         {
         }
 
+        const_iterator(const_iterator const& other)
+            : card_(other.card_)
+            , reader_(other.reader_)
+            , delta_(other.delta_)
+            , pos_(other.pos_)
+            , curr_(other.curr_)
+        {
+        }
+
+        const_iterator& operator = (const_iterator const& other) {
+            if (this == &other) {
+                return *this;
+            }
+            card_ = other.card_;
+            reader_ = other.reader_;
+            delta_ = other.delta_;
+            pos_ = other.pos_;
+            curr_ = other.curr_;
+            return *this;
+        }
+
         u64 operator * () const {
             return curr_;
         }
 
         const_iterator& operator ++ () {
             pos_++;
-            if (pos_ != card_) {
-                //curr_ = reader_.next<u64>();
+            if (pos_ < card_) {
                 curr_ = delta_.next();
             }
             return *this;
@@ -979,8 +1021,8 @@ int main(int argc, char *argv[])
 
     // Try to extract by tag combination
     PerfTimer tm2;
-    const char* tag_host = "host=192.168.0.3";
-    const char* tag_inst = "instance-type=m4.2xlarge";
+    const char* tag_host = "host=192.168.160.245";
+    const char* tag_inst = "instance-type=m3.large";
     u64 hash_host = StringTools::hash(std::make_pair(tag_host, strlen(tag_host)));
     u64 hash_inst = StringTools::hash(std::make_pair(tag_inst, strlen(tag_inst)));
     auto plist_host = tagpair_sketch.extract(hash_host);

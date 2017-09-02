@@ -1021,6 +1021,11 @@ public:
     {
     }
 
+    MetricName(const char* str)
+        : name_(str)
+    {
+    }
+
     StringT get_value() const {
         return std::make_pair(name_.data(), name_.size());
     }
@@ -1053,6 +1058,11 @@ class TagValuePair {
 public:
     TagValuePair(const char* begin, const char* end)
         : value_(begin, end)
+    {
+    }
+
+    TagValuePair(const char* str)
+        : value_(str)
     {
     }
 
@@ -1089,25 +1099,58 @@ public:
 };
 
 
+class IndexQueryResultsIterator {
+    CompressedPListConstIterator it_;
+    StringPool const* spool_;
+public:
+    IndexQueryResultsIterator(CompressedPListConstIterator postinglist, StringPool const* spool)
+        : it_(postinglist)
+        , spool_(spool)
+    {
+    }
+
+    u64 operator * () const {
+        return *it_;
+    }
+
+    IndexQueryResultsIterator& operator ++ () {
+        ++it_;
+        return *this;
+    }
+
+    bool operator == (IndexQueryResultsIterator const& other) const {
+        return it_ == other.it_;
+    }
+
+    bool operator != (CompressedPListConstIterator const& other) const {
+        return it_ != other.it_;
+    }
+};
+
 class IndexQueryResults {
     CompressedPList postinglist_;
+    StringPool const* spool_;
 public:
-    IndexQueryResults() {}
+    IndexQueryResults()
+        : spool_(nullptr)
+    {}
 
-    IndexQueryResults(CompressedPList&& plist)
+    IndexQueryResults(CompressedPList&& plist, StringPool const* spool)
         : postinglist_(plist)
+        , spool_(spool)
     {
     }
 
     template<class Checkable>
-    IndexQueryResults(CompressedPList&& plist, StringPool const& spool, Checkable const& value)
+    IndexQueryResults(CompressedPList&& plist, StringPool const* spool, Checkable const& value)
         : postinglist_(std::move(plist))
+        , spool_(spool)
     {
         bool rewrite = false;
         // Check for falce positives
         for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
             auto id = *it;
-            auto str = spool.str(id);
+            auto str = spool_->str(id);
             if (!value.check(str.first, str.first + str.second)) {
                 rewrite = true;
                 break;
@@ -1118,7 +1161,7 @@ public:
             CompressedPList newplist;
             for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
                 auto id = *it;
-                auto str = spool.str(id);
+                auto str = spool_->str(id);
                 if (value.check(str.first, str.first + str.second)) {
                     newplist.add(id);
                 }
@@ -1128,8 +1171,30 @@ public:
     }
 
     IndexQueryResults intersection(IndexQueryResults const& other) {
-        IndexQueryResults result(postinglist_ & other.postinglist_);
+        IndexQueryResults result(postinglist_ & other.postinglist_, spool_);
         return result;
+    }
+
+    IndexQueryResults difference(IndexQueryResults const& other) {
+        IndexQueryResults result(postinglist_ ^ other.postinglist_, spool_);
+        return result;
+    }
+
+    IndexQueryResults join(IndexQueryResults const& other) {
+        IndexQueryResults result(postinglist_ | other.postinglist_, spool_);
+        return result;
+    }
+
+    size_t cardinality() const {
+        return postinglist_.cardinality();
+    }
+
+    IndexQueryResultsIterator begin() const {
+        return IndexQueryResultsIterator(postinglist_.begin(), spool_);
+    }
+
+    IndexQueryResultsIterator end() const {
+        return IndexQueryResultsIterator(postinglist_.end(), spool_);
     }
 };
 
@@ -1162,13 +1227,17 @@ public:
     }
 };
 
-struct TagValuePairList : IndexQueryNodeBase {
-    constexpr static const char* node_name_ = "TagValuePairList";
+/**
+ * Extracts only series that have specified tag-value
+ * combinations.
+ */
+struct IncludeTags : IndexQueryNodeBase {
+    constexpr static const char* node_name_ = "include-tags";
     MetricName metric_;
     std::vector<TagValuePair> pairs_;
 
     template<class Iter>
-    TagValuePairList(MetricName const& metric, Iter begin, Iter end)
+    IncludeTags(MetricName const& metric, Iter begin, Iter end)
         : IndexQueryNodeBase(node_name_)
         , metric_(metric)
         , pairs_(begin, end)
@@ -1178,11 +1247,39 @@ struct TagValuePairList : IndexQueryNodeBase {
     virtual IndexQueryResults query(IndexBase const&) const;
 };
 
-IndexQueryResults TagValuePairList::query(IndexBase const& index) const {
+IndexQueryResults IncludeTags::query(IndexBase const& index) const {
     IndexQueryResults results = index.metric_query(metric_);
     for(auto const& tv: pairs_) {
         auto res = index.tagvalue_query(tv);
         results.intersection(res);
+    }
+}
+
+/**
+ * Extracts only series that doesn't have specified tag-value
+ * combinations.
+ */
+struct ExcludeTags : IndexQueryNodeBase {
+    constexpr static const char* node_name_ = "include-tags";
+    MetricName metric_;
+    std::vector<TagValuePair> pairs_;
+
+    template<class Iter>
+    ExcludeTags(MetricName const& metric, Iter begin, Iter end)
+        : IndexQueryNodeBase(node_name_)
+        , metric_(metric)
+        , pairs_(begin, end)
+    {
+    }
+
+    virtual IndexQueryResults query(IndexBase const&) const;
+};
+
+IndexQueryResults ExcludeTags::query(IndexBase const& index) const {
+    IndexQueryResults results = index.metric_query(metric_);
+    for(auto const& tv: pairs_) {
+        auto res = index.tagvalue_query(tv);
+        results.difference(res);
     }
 }
 
@@ -1219,6 +1316,29 @@ public:
     {
     }
 
+    size_t cardinality() const {
+        return table_.size();
+    }
+
+    size_t memory_use() const {
+        // TODO: use counting allocator for table_ to provide memory stats
+        size_t sm = metrics_names_.get_size_in_bytes();
+        size_t st = tagvalue_pairs_.get_size_in_bytes();
+        size_t sp = pool_.mem_used();
+        return sm + st + sp;
+    }
+
+    size_t index_memory_use() const {
+        // TODO: use counting allocator for table_ to provide memory stats
+        size_t sm = metrics_names_.get_size_in_bytes();
+        size_t st = tagvalue_pairs_.get_size_in_bytes();
+        return sm + st;
+    }
+
+    size_t pool_memory_use() const {
+        return pool_.mem_used();
+    }
+
     aku_Status append(const char* begin, const char* end) {
         // Parse string value and sort tags alphabetically
         const char* tags_begin;
@@ -1251,84 +1371,44 @@ public:
     virtual IndexQueryResults tagvalue_query(const TagValuePair &value) const {
         auto hash = StringTools::hash(value.get_value());
         auto post = tagvalue_pairs_.extract(hash);
-        return IndexQueryResults(std::move(post), pool_, value);
+        return IndexQueryResults(std::move(post), &pool_, value);
     }
 
     virtual IndexQueryResults metric_query(const MetricName &value) const {
         auto hash = StringTools::hash(value.get_value());
         auto post = metrics_names_.extract(hash);
-        return IndexQueryResults(std::move(post), pool_, value);
+        return IndexQueryResults(std::move(post), &pool_, value);
     }
 };
 
 int main(int argc, char *argv[])
 {
-    StringPool pool;
-    StringTools::TableT table = StringTools::create_table(100000);
-    StringTools::InvT inv_tab;
-    CMSketch metrics_sketch(3, 1024);
-    CMSketch tagpair_sketch(3, 1024);
-    char buffer[0x1000];
-    std::vector<u64> samples;
+    Index index;
     //for (auto line: sample_lines) {
     for (std::string line; std::getline(std::cin, line);) {
-        const char* tags_begin;
-        const char* tags_end;
-        auto status = SeriesParser::to_normal_form(line.data(), line.data() + line.size(), buffer, buffer + 0x1000, &tags_begin, &tags_end);
-        if (status != AKU_SUCCESS) {
-            std::cout << "error: " << status << std::endl;
-            std::cout << "line: " << line << std::endl;
-            std::abort();
-        }
-        auto name = std::make_pair((const char*)buffer, tags_end - buffer);
-        if (table.count(name) == 0) {
-            auto id = pool.add(buffer, tags_end);
-            if (id == 0) {
-                std::cout << "can't add string \"" << line << "\"" << std::endl;
-                std::abort();
-            }
-            if (samples.size() < 10) {
-                samples.push_back(id);
-            }
-            write_tags(tags_begin, tags_end, &tagpair_sketch, id);
-            name = pool.str(id);  // name now have the same lifetime as pool
-            table[name] = id;
-            metrics_sketch.add(id);
-        }
+        index.append(line.data(), line.data() + line.size());
     }
-    std::cout << "number of unique series: " << table.size() << std::endl;
-    std::cout << "string pool size: " << pool.size() << " lines, " << pool.mem_used() << " bytes" << std::endl;
-    std::cout << "metric index size: " << metrics_sketch.get_size_in_bytes() << " bytes" << std::endl;
-    std::cout << "tags index size: " << tagpair_sketch.get_size_in_bytes() << " bytes" << std::endl;
-
-    // Try to extract by id
-    for (auto id: samples) {
-        PerfTimer tm;
-        auto out = metrics_sketch.extract(id);
-        double elapsed = tm.elapsed();
-        std::cout << "searching for id: " << id << std::endl;
-        std::cout << "out size = " << out.cardinality() << std::endl;
-        for (auto it = out.begin(); it != out.end(); ++it) {
-            std::cout << "id - " << (*it) << std::endl;
-        }
-        std::cout << "elapsed: " << elapsed << std::endl;
-    }
+    std::cout << "number of unique series: " << index.cardinality() << std::endl;
+    std::cout << "memory use: " << index.memory_use() << " bytes" << std::endl;
+    std::cout << "string pool size: " << index.pool_memory_use() << " bytes" << std::endl;
+    std::cout << "index size: " << index.index_memory_use() << " bytes" << std::endl;
 
     // Try to extract by tag combination
-    PerfTimer tm2;
     const char* tag_host = "host=192.168.160.245";
     const char* tag_inst = "instance-type=m3.large";
-    u64 hash_host = StringTools::hash(std::make_pair(tag_host, strlen(tag_host)));
-    u64 hash_inst = StringTools::hash(std::make_pair(tag_inst, strlen(tag_inst)));
-    auto plist_host = tagpair_sketch.extract(hash_host);
-    auto plist_inst = tagpair_sketch.extract(hash_inst);
-    auto plist_final = plist_host & plist_inst;
+    std::vector<TagValuePair> tgv;
+    tgv.emplace_back(tag_host);
+    tgv.emplace_back(tag_inst);
+    MetricName mname("cpu.user");
+    IncludeTags tags(mname, tgv.begin(), tgv.end());
+    PerfTimer tm2;
+    auto results = tags.query(index);
     double elapsed = tm2.elapsed();
     std::cout << "Tag combination extracted, time: " << (elapsed*1000000.0) << " usec" << std::endl;
-    for (auto it = plist_final.begin(); it != plist_final.end(); ++it) {
-        auto id = *it;
-        auto sname = pool.str(id);
-        std::cout << "Name found: " << std::string(sname.first, sname.first + sname.second) << std::endl;
-    }
+//    for (auto it = plist_final.begin(); it != plist_final.end(); ++it) {
+//        auto id = *it;
+//        auto sname = pool.str(id);
+//        std::cout << "Name found: " << std::string(sname.first, sname.first + sname.second) << std::endl;
+//    }
     return 0;
 }

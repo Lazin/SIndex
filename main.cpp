@@ -12,6 +12,7 @@
 #include <ctime>
 #include <vector>
 #include <random>
+#include <iterator>
 
 #define BOOST_THROW_EXCEPTION(x) throw x;
 
@@ -226,7 +227,7 @@ public:
      * @param bits is a Z-order encoded position in the string buffer
      * @return 0-copy string representation (or empty string)
      */
-    StringT str(u64 bits);
+    StringT str(u64 bits) const;
 
     //! Get number of stored strings atomically
     size_t size() const;
@@ -301,13 +302,13 @@ u64 StringPool::add(const char* begin, const char* end) {
     return bin_index*MAX_BIN_SIZE + offset;
 }
 
-StringT StringPool::str(u64 bits) {
+StringT StringPool::str(u64 bits) const {
     u64 ix     = bits / MAX_BIN_SIZE;
     u64 offset = bits % MAX_BIN_SIZE;
     assert(ix != 0);
     std::lock_guard<std::mutex> guard(pool_mutex);
     if (ix <= pool.size()) {
-        std::vector<char>* bin = &pool.at(ix - 1);
+        std::vector<char> const* bin = &pool.at(ix - 1);
         if (offset < bin->size()) {
             const char* pstr = bin->data() + offset;
             return std::make_pair(pstr, std::strlen(pstr));
@@ -531,11 +532,13 @@ struct Base128StreamWriter {
         : buffer_(&buffer)
     {}
 
-//    Base128StreamWriter(Base128StreamWriter& other)
-//        : buffer_(other.buffer_)
-//    {}
-    Base128StreamWriter(Base128StreamWriter const& other) = delete;
-    Base128StreamWriter& operator = (Base128StreamWriter const& other) = delete;
+    Base128StreamWriter(Base128StreamWriter const& other)
+        : buffer_(other.buffer_)
+    {}
+
+    Base128StreamWriter& operator = (Base128StreamWriter const& other) {
+        buffer_ = other.buffer_;
+    }
 
     void reset(std::vector<char>& buffer) {
         buffer_ = &buffer;
@@ -587,17 +590,32 @@ struct Base128StreamReader {
 };
 
 template <class Stream, typename TVal> struct DeltaStreamWriter {
-    Stream& stream_;
+    Stream* stream_;
     TVal   prev_;
 
     template<class Substream>
     DeltaStreamWriter(Substream& stream)
-        : stream_(stream)
+        : stream_(&stream)
         , prev_{}
     {}
 
+    DeltaStreamWriter(DeltaStreamWriter const& other)
+        : stream_(other.stream_)
+        , prev_(other.prev_)
+    {
+    }
+
+    DeltaStreamWriter& operator = (DeltaStreamWriter const& other) {
+        if (this == &other) {
+            return *this;
+        }
+        stream_ = other.stream_;
+        prev_   = other.prev_;
+        return *this;
+    }
+
     bool put(TVal value) {
-        auto result = stream_.put(static_cast<TVal>(value) - prev_);
+        auto result = stream_->put(static_cast<TVal>(value) - prev_);
         prev_       = value;
         return result;
     }
@@ -637,6 +655,91 @@ template <class Stream, typename TVal> struct DeltaStreamReader {
 
 }
 
+// Iterator for compressed PList
+
+class CompressedPListConstIterator {
+    size_t card_;
+    Base128StreamReader reader_;
+    DeltaStreamReader<Base128StreamReader, u64> delta_;
+    size_t pos_;
+    u64 curr_;
+public:
+    typedef u64 value_type;
+
+    CompressedPListConstIterator(std::vector<char> const& vec, size_t c)
+        : card_(c)
+        , reader_(reinterpret_cast<const unsigned char*>(vec.data()),
+                  reinterpret_cast<const unsigned char*>(vec.data() + vec.size()))
+        , delta_(reader_)
+        , pos_(0)
+    {
+        if (pos_ < card_) {
+            curr_ = delta_.next();
+        }
+    }
+
+    /**
+     * @brief Create iterator pointing to the end of the sequence
+     */
+    CompressedPListConstIterator(std::vector<char> const& vec, size_t c, bool)
+        : card_(c)
+        , reader_(reinterpret_cast<const unsigned char*>(vec.data()),
+                  reinterpret_cast<const unsigned char*>(vec.data() + vec.size()))
+        , delta_(reader_)
+        , pos_(c)
+        , curr_()
+    {
+    }
+
+    CompressedPListConstIterator(CompressedPListConstIterator const& other)
+        : card_(other.card_)
+        , reader_(other.reader_)
+        , delta_(other.delta_)
+        , pos_(other.pos_)
+        , curr_(other.curr_)
+    {
+    }
+
+    CompressedPListConstIterator& operator = (CompressedPListConstIterator const& other) {
+        if (this == &other) {
+            return *this;
+        }
+        card_ = other.card_;
+        reader_ = other.reader_;
+        delta_ = other.delta_;
+        pos_ = other.pos_;
+        curr_ = other.curr_;
+        return *this;
+    }
+
+    u64 operator * () const {
+        return curr_;
+    }
+
+    CompressedPListConstIterator& operator ++ () {
+        pos_++;
+        if (pos_ < card_) {
+            curr_ = delta_.next();
+        }
+        return *this;
+    }
+
+    bool operator == (CompressedPListConstIterator const& other) const {
+        return pos_ == other.pos_;
+    }
+
+    bool operator != (CompressedPListConstIterator const& other) const {
+        return pos_ != other.pos_;
+    }
+};
+
+namespace std {
+    template<>
+    struct iterator_traits<CompressedPListConstIterator> {
+        typedef u64 value_type;
+        typedef forward_iterator_tag iterator_category;
+    };
+}
 
 class CompressedPList {
     std::vector<char> buffer_;
@@ -661,6 +764,20 @@ public:
         , cardinality_(other.cardinality_)
     {
         assert(buffer_.size());
+    }
+
+    CompressedPList& operator = (CompressedPList && other) {
+        if (this == &other) {
+            return *this;
+        }
+        buffer_.swap(other.buffer_);
+        // we don't need to assign writer_ since it contains pointer to buffer_
+        // already
+        // delta already contain correct pointer to writer_ we only need to
+        // update prev_ field
+        delta_.prev_ = other.delta_.prev_;
+        cardinality_ = other.cardinality_;
+        return *this;
     }
 
     CompressedPList(CompressedPList && other)
@@ -698,88 +815,27 @@ public:
         return result;
     }
 
-    // Iteration
-
-    class const_iterator {
-        size_t card_;
-        Base128StreamReader reader_;
-        DeltaStreamReader<Base128StreamReader, u64> delta_;
-        size_t pos_;
-        u64 curr_;
-    public:
-        const_iterator(std::vector<char> const& vec, size_t c)
-            : card_(c)
-            , reader_(reinterpret_cast<const unsigned char*>(vec.data()),
-                      reinterpret_cast<const unsigned char*>(vec.data() + vec.size()))
-            , delta_(reader_)
-            , pos_(0)
-        {
-            if (pos_ < card_) {
-                curr_ = delta_.next();
-            }
-        }
-
-        /**
-         * @brief Create iterator pointing to the end of the sequence
-         */
-        const_iterator(std::vector<char> const& vec, size_t c, bool)
-            : card_(c)
-            , reader_(reinterpret_cast<const unsigned char*>(vec.data()),
-                      reinterpret_cast<const unsigned char*>(vec.data() + vec.size()))
-            , delta_(reader_)
-            , pos_(c)
-            , curr_()
-        {
-        }
-
-        const_iterator(const_iterator const& other)
-            : card_(other.card_)
-            , reader_(other.reader_)
-            , delta_(other.delta_)
-            , pos_(other.pos_)
-            , curr_(other.curr_)
-        {
-        }
-
-        const_iterator& operator = (const_iterator const& other) {
-            if (this == &other) {
-                return *this;
-            }
-            card_ = other.card_;
-            reader_ = other.reader_;
-            delta_ = other.delta_;
-            pos_ = other.pos_;
-            curr_ = other.curr_;
-            return *this;
-        }
-
-        u64 operator * () const {
-            return curr_;
-        }
-
-        const_iterator& operator ++ () {
-            pos_++;
-            if (pos_ < card_) {
-                curr_ = delta_.next();
-            }
-            return *this;
-        }
-
-        bool operator == (const_iterator const& other) const {
-            return pos_ == other.pos_;
-        }
-
-        bool operator != (const_iterator const& other) const {
-            return pos_ != other.pos_;
-        }
-    };
-
-    const_iterator begin() const {
-        return const_iterator(buffer_, cardinality_);
+    CompressedPList operator | (CompressedPList const& other) const {
+        CompressedPList result;
+        std::set_union(begin(), end(), other.begin(), other.end(),
+                       std::back_inserter(result));
+        return result;
     }
 
-    const_iterator end() const {
-        return const_iterator(buffer_, cardinality_, false);
+    CompressedPList operator ^ (CompressedPList const& other) const {
+        CompressedPList result;
+        std::set_difference(begin(), end(), other.begin(), other.end(),
+                            std::back_inserter(result));
+        return result;
+    }
+
+
+    CompressedPListConstIterator begin() const {
+        return CompressedPListConstIterator(buffer_, cardinality_);
+    }
+
+    CompressedPListConstIterator end() const {
+        return CompressedPListConstIterator(buffer_, cardinality_, false);
     }
 };
 
@@ -850,7 +906,7 @@ public:
         return sum;
     }
 
-    TVal extract(u64 value) {
+    TVal extract(u64 value) const {
         std::vector<const TVal*> inputs;
         for (u32 i = 0; i < N; i++) {
             // calculate hash from id to K
@@ -937,7 +993,7 @@ double PerfTimer::elapsed() const {
            double(curr.tv_nsec - _start_time.tv_nsec)/1000000000.0;
 }
 
-void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 id) {
+static void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 id) {
     const char* tag_begin = begin;
     const char* tag_end = begin;
     bool err = false;
@@ -957,6 +1013,41 @@ void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 i
 }
 
 
+class MetricName {
+    std::string name_;
+public:
+    MetricName(const char* begin, const char* end)
+        : name_(begin, end)
+    {
+    }
+
+    StringT get_value() const {
+        return std::make_pair(name_.data(), name_.size());
+    }
+
+    bool check(const char* begin, const char* end) const {
+        const char* p = begin;
+        // skip metric name
+        p = skip_space(p, end);
+        if (p == end) {
+            return false;
+        }
+        const char* m = p;
+        while(*p != ' ') {
+            p++;
+        }
+        // compare
+        bool eq = std::equal(m, p, name_.begin(), name_.end());
+        if (eq) {
+            return true;
+        }
+        return false;
+    }
+};
+
+/**
+ * @brief Tag value pair
+ */
 class TagValuePair {
     std::string value_;  //! Value that holds both tag and value
 public:
@@ -969,7 +1060,7 @@ public:
         return std::make_pair(value_.data(), value_.size());
     }
 
-    bool contains(const char* begin, const char* end) const {
+    bool check(const char* begin, const char* end) const {
         const char* p = begin;
         // skip metric name
         p = skip_space(p, end);
@@ -999,16 +1090,59 @@ public:
 
 
 class IndexQueryResults {
+    CompressedPList postinglist_;
+public:
+    IndexQueryResults() {}
 
+    IndexQueryResults(CompressedPList&& plist)
+        : postinglist_(plist)
+    {
+    }
+
+    template<class Checkable>
+    IndexQueryResults(CompressedPList&& plist, StringPool const& spool, Checkable const& value)
+        : postinglist_(std::move(plist))
+    {
+        bool rewrite = false;
+        // Check for falce positives
+        for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
+            auto id = *it;
+            auto str = spool.str(id);
+            if (!value.check(str.first, str.first + str.second)) {
+                rewrite = true;
+                break;
+            }
+        }
+        if (rewrite) {
+            // This code only gets triggered when false positives are present
+            CompressedPList newplist;
+            for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
+                auto id = *it;
+                auto str = spool.str(id);
+                if (value.check(str.first, str.first + str.second)) {
+                    newplist.add(id);
+                }
+            }
+            postinglist_ = std::move(newplist);
+        }
+    }
+
+    IndexQueryResults intersection(IndexQueryResults const& other) {
+        IndexQueryResults result(postinglist_ & other.postinglist_);
+        return result;
+    }
 };
 
 struct IndexBase {
     virtual ~IndexBase() = default;
-    virtual IndexQueryResults query(TagValuePair const& value) = 0;
+    virtual IndexQueryResults tagvalue_query(TagValuePair const& value) const = 0;
+    virtual IndexQueryResults metric_query(MetricName const& value) const = 0;
 };
 
-struct IndexQueryNodeBase {
+class IndexQueryNodeBase {
     const char* const name_;
+
+public:
 
     /**
      * @brief IndexQueryNodeBase c-tor
@@ -1021,8 +1155,36 @@ struct IndexQueryNodeBase {
 
     virtual ~IndexQueryNodeBase() = default;
 
-    virtual IndexQueryResults query(const IndexBase&) = 0;
+    virtual IndexQueryResults query(const IndexBase&) const = 0;
+
+    const char* get_name() const {
+        return name_;
+    }
 };
+
+struct TagValuePairList : IndexQueryNodeBase {
+    constexpr static const char* node_name_ = "TagValuePairList";
+    MetricName metric_;
+    std::vector<TagValuePair> pairs_;
+
+    template<class Iter>
+    TagValuePairList(MetricName const& metric, Iter begin, Iter end)
+        : IndexQueryNodeBase(node_name_)
+        , metric_(metric)
+        , pairs_(begin, end)
+    {
+    }
+
+    virtual IndexQueryResults query(IndexBase const&) const;
+};
+
+IndexQueryResults TagValuePairList::query(IndexBase const& index) const {
+    IndexQueryResults results = index.metric_query(metric_);
+    for(auto const& tv: pairs_) {
+        auto res = index.tagvalue_query(tv);
+        results.intersection(res);
+    }
+}
 
 /**
  * @brief The IndexQuery class
@@ -1041,11 +1203,10 @@ struct IndexQueryNodeBase {
  *  )
  */
 class IndexQuery {
-    std::shared_ptr<IndexQueryCondition> root_;
 public:
 };
 
-class Index {
+class Index : public IndexBase {
     StringPool pool_;
     StringTools::TableT table_;
     CMSketch metrics_names_;
@@ -1085,6 +1246,18 @@ public:
             metrics_names_.add(id);
         }
         return AKU_SUCCESS;
+    }
+
+    virtual IndexQueryResults tagvalue_query(const TagValuePair &value) const {
+        auto hash = StringTools::hash(value.get_value());
+        auto post = tagvalue_pairs_.extract(hash);
+        return IndexQueryResults(std::move(post), pool_, value);
+    }
+
+    virtual IndexQueryResults metric_query(const MetricName &value) const {
+        auto hash = StringTools::hash(value.get_value());
+        auto post = metrics_names_.extract(hash);
+        return IndexQueryResults(std::move(post), pool_, value);
     }
 };
 

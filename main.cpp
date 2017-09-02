@@ -956,6 +956,95 @@ void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 i
     }
 }
 
+
+class TagValuePair {
+    std::string value_;  //! Value that holds both tag and value
+public:
+    TagValuePair(const char* begin, const char* end)
+        : value_(begin, end)
+    {
+    }
+
+    StringT get_value() const {
+        return std::make_pair(value_.data(), value_.size());
+    }
+
+    bool contains(const char* begin, const char* end) const {
+        const char* p = begin;
+        // skip metric name
+        p = skip_space(p, end);
+        if (p == end) {
+            return false;
+        }
+        while(*p != ' ') {
+            p++;
+        }
+        p = skip_space(p, end);
+        if (p == end) {
+            return false;
+        }
+        // Check tags
+        bool error = false;
+        while (!error && p < end) {
+            const char* tag_start = p;
+            const char* tag_end = skip_tag(tag_start, end, &error);
+            bool eq = std::equal(tag_start, tag_end, value_.begin(), value_.end());
+            if (eq) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+
+class IndexQueryResults {
+
+};
+
+struct IndexBase {
+    virtual ~IndexBase() = default;
+    virtual IndexQueryResults query(TagValuePair const& value) = 0;
+};
+
+struct IndexQueryNodeBase {
+    const char* const name_;
+
+    /**
+     * @brief IndexQueryNodeBase c-tor
+     * @param name is a static string that contains node name (used for introspection)
+     */
+    IndexQueryNodeBase(const char* name)
+        : name_(name)
+    {
+    }
+
+    virtual ~IndexQueryNodeBase() = default;
+
+    virtual IndexQueryResults query(const IndexBase&) = 0;
+};
+
+/**
+ * @brief The IndexQuery class
+ *
+ * Index query is an expression tree composed from
+ * tag-value pairs and conditions:
+ *
+ * - difference
+ * - intersection
+ * - union
+ *
+ * E.g.
+ *  union(
+ *      intersection(tag1=value1, tag2=value2, tag3=value3),
+ *      intersection(tag4=value4, tag5=value5)
+ *  )
+ */
+class IndexQuery {
+    std::shared_ptr<IndexQueryCondition> root_;
+public:
+};
+
 class Index {
     StringPool pool_;
     StringTools::TableT table_;

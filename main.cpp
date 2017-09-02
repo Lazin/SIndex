@@ -1109,8 +1109,10 @@ public:
     {
     }
 
-    u64 operator * () const {
-        return *it_;
+    StringT operator * () const {
+        auto id = *it_;
+        auto str = spool_->str(id);
+        return str;
     }
 
     IndexQueryResultsIterator& operator ++ () {
@@ -1122,7 +1124,7 @@ public:
         return it_ == other.it_;
     }
 
-    bool operator != (CompressedPListConstIterator const& other) const {
+    bool operator != (IndexQueryResultsIterator const& other) const {
         return it_ != other.it_;
     }
 };
@@ -1384,8 +1386,8 @@ public:
 int main(int argc, char *argv[])
 {
     Index index;
-    //for (auto line: sample_lines) {
-    for (std::string line; std::getline(std::cin, line);) {
+    for (auto line: sample_lines) {
+    //for (std::string line; std::getline(std::cin, line);) {
         index.append(line.data(), line.data() + line.size());
     }
     std::cout << "number of unique series: " << index.cardinality() << std::endl;
@@ -1405,10 +1407,9 @@ int main(int argc, char *argv[])
     auto results = tags.query(index);
     double elapsed = tm2.elapsed();
     std::cout << "Tag combination extracted, time: " << (elapsed*1000000.0) << " usec" << std::endl;
-//    for (auto it = plist_final.begin(); it != plist_final.end(); ++it) {
-//        auto id = *it;
-//        auto sname = pool.str(id);
-//        std::cout << "Name found: " << std::string(sname.first, sname.first + sname.second) << std::endl;
-//    }
+    for (auto it = results.begin(); it != results.end(); ++it) {
+        auto sname = *it;
+        std::cout << "Name found: " << std::string(sname.first, sname.first + sname.second) << std::endl;
+    }
     return 0;
 }

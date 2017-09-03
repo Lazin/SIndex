@@ -763,7 +763,6 @@ public:
         , delta_(writer_)
         , cardinality_(other.cardinality_)
     {
-        assert(buffer_.size());
     }
 
     CompressedPList& operator = (CompressedPList && other) {
@@ -786,7 +785,6 @@ public:
         , delta_(writer_)
         , cardinality_(other.cardinality_)
     {
-        assert(buffer_.size());
     }
 
     CompressedPList& operator = (CompressedPList const& other) = delete;
@@ -1012,6 +1010,20 @@ static void write_tags(const char* begin, const char* end, CMSketch* dest_sketch
     }
 }
 
+static StringT skip_metric_name(const char* begin, const char* end) {
+    const char* p = begin;
+    // skip metric name
+    p = skip_space(p, end);
+    if (p == end) {
+        return std::make_pair(nullptr, 0);
+    }
+    const char* m = p;
+    while(*p != ' ') {
+        p++;
+    }
+    return std::make_pair(m, p - m);
+}
+
 
 class MetricName {
     std::string name_;
@@ -1031,18 +1043,12 @@ public:
     }
 
     bool check(const char* begin, const char* end) const {
-        const char* p = begin;
-        // skip metric name
-        p = skip_space(p, end);
-        if (p == end) {
+        auto name = skip_metric_name(begin, end);
+        if (name.second == 0) {
             return false;
         }
-        const char* m = p;
-        while(*p != ' ') {
-            p++;
-        }
         // compare
-        bool eq = std::equal(m, p, name_.begin(), name_.end());
+        bool eq = std::equal(name.first, name.first + name.second, name_.begin(), name_.end());
         if (eq) {
             return true;
         }
@@ -1093,6 +1099,7 @@ public:
             if (eq) {
                 return true;
             }
+            p = skip_space(tag_end, end);
         }
         return false;
     }
@@ -1365,7 +1372,12 @@ public:
             write_tags(tags_begin, tags_end, &tagvalue_pairs_, id);
             name = pool_.str(id);  // name now have the same lifetime as pool
             table_[name] = id;
-            metrics_names_.add(id);
+            auto mname = skip_metric_name(buffer, tags_begin);
+            if (mname.second == 0) {
+                return AKU_EBAD_DATA;
+            }
+            auto mhash = StringTools::hash(mname);
+            metrics_names_.add(mhash, id);
         }
         return AKU_SUCCESS;
     }

@@ -746,6 +746,7 @@ class CompressedPList {
     Base128StreamWriter writer_;
     DeltaStreamWriter<Base128StreamWriter, u64> delta_;
     size_t cardinality_;
+    bool moved_;
 public:
 
     typedef u64 value_type;
@@ -754,6 +755,7 @@ public:
         : writer_(buffer_)
         , delta_(writer_)
         , cardinality_(0)
+        , moved_(false)
     {
     }
 
@@ -762,13 +764,17 @@ public:
         , writer_(buffer_)
         , delta_(writer_)
         , cardinality_(other.cardinality_)
+        , moved_(false)
     {
+        assert(!other.moved_);
     }
 
     CompressedPList& operator = (CompressedPList && other) {
+        assert(!other.moved_);
         if (this == &other) {
             return *this;
         }
+        other.moved_ = true;
         buffer_.swap(other.buffer_);
         // we don't need to assign writer_ since it contains pointer to buffer_
         // already
@@ -784,29 +790,37 @@ public:
         , writer_(buffer_)
         , delta_(writer_)
         , cardinality_(other.cardinality_)
+        , moved_(false)
     {
+        assert(!other.moved_);
+        other.moved_ = true;
     }
 
     CompressedPList& operator = (CompressedPList const& other) = delete;
 
     void add(u64 x) {
+        assert(!moved_);
         delta_.put(x);
         cardinality_++;
     }
 
     void push_back(u64 x) {
+        assert(!moved_);
         add(x);
     }
 
     size_t getSizeInBytes() const {
+        assert(!moved_);
         return buffer_.capacity();
     }
 
     size_t cardinality() const {
+        assert(!moved_);
         return cardinality_;
     }
 
     CompressedPList operator & (CompressedPList const& other) const {
+        assert(!moved_);
         CompressedPList result;
         std::set_intersection(begin(), end(), other.begin(), other.end(),
                               std::back_inserter(result));
@@ -814,6 +828,7 @@ public:
     }
 
     CompressedPList operator | (CompressedPList const& other) const {
+        assert(!moved_);
         CompressedPList result;
         std::set_union(begin(), end(), other.begin(), other.end(),
                        std::back_inserter(result));
@@ -821,6 +836,7 @@ public:
     }
 
     CompressedPList operator ^ (CompressedPList const& other) const {
+        assert(!moved_);
         CompressedPList result;
         std::set_difference(begin(), end(), other.begin(), other.end(),
                             std::back_inserter(result));
@@ -829,10 +845,12 @@ public:
 
 
     CompressedPListConstIterator begin() const {
+        assert(!moved_);
         return CompressedPListConstIterator(buffer_, cardinality_);
     }
 
     CompressedPListConstIterator end() const {
+        assert(!moved_);
         return CompressedPListConstIterator(buffer_, cardinality_, false);
     }
 };
@@ -1150,11 +1168,60 @@ public:
     {
     }
 
-    template<class Checkable>
-    IndexQueryResults(CompressedPList&& plist, StringPool const* spool, Checkable const& value)
-        : postinglist_(std::move(plist))
-        , spool_(spool)
+    IndexQueryResults(IndexQueryResults const& other)
+        : postinglist_(other.postinglist_)
+        , spool_(other.spool_)
     {
+    }
+
+    IndexQueryResults& operator = (IndexQueryResults && other) {
+        if (this == &other) {
+            return *this;
+        }
+        postinglist_ = std::move(other.postinglist_);
+        spool_ = other.spool_;
+        return *this;
+    }
+
+    IndexQueryResults(IndexQueryResults&& plist)
+        : postinglist_(std::move(plist.postinglist_))
+        , spool_(plist.spool_)
+    {
+    }
+
+    template<class Checkable>
+    IndexQueryResults filter(std::vector<Checkable> const& values) {
+        bool rewrite = false;
+        // Check for falce positives
+        for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
+            auto id = *it;
+            auto str = spool_->str(id);
+            for (auto const& value: values) {
+                if (!value.check(str.first, str.first + str.second)) {
+                    rewrite = true;
+                    break;
+                }
+            }
+        }
+        if (rewrite) {
+            // This code only gets triggered when false positives are present
+            CompressedPList newplist;
+            for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
+                auto id = *it;
+                auto str = spool_->str(id);
+                for (auto const& value: values) {
+                    if (value.check(str.first, str.first + str.second)) {
+                        newplist.add(id);
+                    }
+                }
+            }
+            return IndexQueryResults(std::move(newplist), spool_);
+        }
+        return *this;
+    }
+
+    template<class Checkable>
+    IndexQueryResults filter(Checkable const& value) {
         bool rewrite = false;
         // Check for falce positives
         for (auto it = postinglist_.begin(); it != postinglist_.end(); ++it) {
@@ -1175,8 +1242,9 @@ public:
                     newplist.add(id);
                 }
             }
-            postinglist_ = std::move(newplist);
+            return IndexQueryResults(std::move(newplist), spool_);
         }
+        return *this;
     }
 
     IndexQueryResults intersection(IndexQueryResults const& other) {
@@ -1260,8 +1328,9 @@ IndexQueryResults IncludeTags::query(IndexBase const& index) const {
     IndexQueryResults results = index.metric_query(metric_);
     for(auto const& tv: pairs_) {
         auto res = index.tagvalue_query(tv);
-        results.intersection(res);
+        results = results.intersection(res);
     }
+    return results.filter(metric_).filter(pairs_);
 }
 
 /**
@@ -1385,21 +1454,21 @@ public:
     virtual IndexQueryResults tagvalue_query(const TagValuePair &value) const {
         auto hash = StringTools::hash(value.get_value());
         auto post = tagvalue_pairs_.extract(hash);
-        return IndexQueryResults(std::move(post), &pool_, value);
+        return IndexQueryResults(std::move(post), &pool_);
     }
 
     virtual IndexQueryResults metric_query(const MetricName &value) const {
         auto hash = StringTools::hash(value.get_value());
         auto post = metrics_names_.extract(hash);
-        return IndexQueryResults(std::move(post), &pool_, value);
+        return IndexQueryResults(std::move(post), &pool_);
     }
 };
 
 int main(int argc, char *argv[])
 {
     Index index;
-    for (auto line: sample_lines) {
-    //for (std::string line; std::getline(std::cin, line);) {
+    //for (auto line: sample_lines) {
+    for (std::string line; std::getline(std::cin, line);) {
         index.append(line.data(), line.data() + line.size());
     }
     std::cout << "number of unique series: " << index.cardinality() << std::endl;

@@ -346,13 +346,29 @@ struct StringTools {
     typedef std::unordered_set<StringT, decltype(&StringTools::hash), decltype(&StringTools::equal)>
         SetT;
 
+    typedef std::unordered_map<StringT, SetT, decltype(&StringTools::hash), decltype(&StringTools::equal)> L2TableT;
+
+    typedef  std::unordered_map<StringT, L2TableT, decltype(&StringTools::hash), decltype(&StringTools::equal)> L3TableT;
+
     //! Inverted table type (id to string mapping)
     typedef std::unordered_map<u64, StringT> InvT;
 
     static TableT create_table(size_t size);
 
-static SetT create_set(size_t size);
+    static SetT create_set(size_t size);
+
+    static L2TableT create_l2_table(size_t size_hint);
+
+    static L3TableT create_l3_table(size_t size_hint);
 };
+
+StringTools::L2TableT StringTools::create_l2_table(size_t size_hint) {
+    return L2TableT(size_hint, &StringTools::hash, &StringTools::equal);
+}
+
+StringTools::L3TableT StringTools::create_l3_table(size_t size_hint) {
+    return L3TableT(size_hint, &StringTools::hash, &StringTools::equal);
+}
 
 size_t StringTools::hash(StringT str) {
     // implementation of Dan Bernstein's djb2
@@ -1248,16 +1264,25 @@ public:
     }
 
     IndexQueryResults intersection(IndexQueryResults const& other) {
+        if (spool_ == nullptr) {
+            spool_ = other.spool_;
+        }
         IndexQueryResults result(postinglist_ & other.postinglist_, spool_);
         return result;
     }
 
     IndexQueryResults difference(IndexQueryResults const& other) {
+        if (spool_ == nullptr) {
+            spool_ = other.spool_;
+        }
         IndexQueryResults result(postinglist_ ^ other.postinglist_, spool_);
         return result;
     }
 
     IndexQueryResults join(IndexQueryResults const& other) {
+        if (spool_ == nullptr) {
+            spool_ = other.spool_;
+        }
         IndexQueryResults result(postinglist_ | other.postinglist_, spool_);
         return result;
     }
@@ -1338,7 +1363,7 @@ IndexQueryResults IncludeTags::query(IndexBase const& index) const {
  * combinations.
  */
 struct ExcludeTags : IndexQueryNodeBase {
-    constexpr static const char* node_name_ = "include-tags";
+    constexpr static const char* node_name_ = "exclude-tags";
     MetricName metric_;
     std::vector<TagValuePair> pairs_;
 
@@ -1357,8 +1382,39 @@ IndexQueryResults ExcludeTags::query(IndexBase const& index) const {
     IndexQueryResults results = index.metric_query(metric_);
     for(auto const& tv: pairs_) {
         auto res = index.tagvalue_query(tv);
+        results = results.difference(res);
+    }
+    return results.filter(metric_);
+}
+
+
+struct JoinByTags : IndexQueryNodeBase {
+    constexpr static const char* node_name_ = "join-by-tags";
+    std::vector<MetricName> metrics_;
+    std::vector<TagValuePair> pairs_;
+
+    template<class MIter, class TIter>
+    JoinByTags(MIter mbegin, MIter mend, TIter tbegin, TIter tend)
+        : IndexQueryNodeBase(node_name_)
+        , metrics_(mbegin, mend)
+        , pairs_(tbegin, tend)
+    {
+    }
+
+    virtual IndexQueryResults query(IndexBase const&) const;
+};
+
+IndexQueryResults JoinByTags::query(IndexBase const& index) const {
+    IndexQueryResults results;
+    for(auto const& m: metrics_) {
+        auto res = index.metric_query(m);
+        results = results.join(res);
+    }
+    for(auto const& tv: pairs_) {
+        auto res = index.tagvalue_query(tv);
         results.difference(res);
     }
+    return results.filter(metrics_).filter(pairs_);
 }
 
 /**
@@ -1381,11 +1437,83 @@ class IndexQuery {
 public:
 };
 
+
+/**
+ * @brief Split tag=value pair into tag and value
+ * @return true on success, false otherwise
+ */
+static bool split_pair(StringT pair, StringT* outtag, StringT* outval) {
+    const char* p = pair.first;
+    const char* end = p + pair.second;
+    while (*p != '=' && p < end) {
+        p++;
+    }
+    if (p == end) {
+        return false;
+    }
+    *outtag = std::make_pair(pair.first, p - pair.first);
+    *outval = std::make_pair(p + 1, pair.second - (p - pair.first + 1));
+    return true;
+}
+
+
+class SeriesNameTopology {
+    typedef StringTools::L3TableT IndexT;
+    IndexT index_;
+public:
+    SeriesNameTopology()
+        : index_(StringTools::create_l3_table(1000))
+    {
+    }
+
+    void add_name(StringT name) {
+        StringT metric = skip_metric_name(name.first, name.first + name.second);
+        StringT tags = std::make_pair(name.first + metric.second, name.second - metric.second);
+        auto it = index_.find(metric);
+        if (it == index_.end()) {
+            StringTools::L2TableT tagtable = StringTools::create_l2_table(1024);
+            index_[metric] = std::move(tagtable);
+            it = index_.find(metric);
+        }
+        // Iterate through tags
+        const char* p = tags.first;
+        const char* end = p + tags.second;
+        p = skip_space(p, end);
+        if (p == end) {
+            return;
+        }
+        // Check tags
+        bool error = false;
+        while (!error && p < end) {
+            const char* tag_start = p;
+            const char* tag_end = skip_tag(tag_start, end, &error);
+            auto tagstr = std::make_pair(tag_start, tag_end - tag_start);
+            StringT tag;
+            StringT val;
+            if (!split_pair(tagstr, &tag, &val)) {
+                error = true;
+            }
+            StringTools::L2TableT& tagtable = it->second;
+            auto tagit = tagtable.find(tag);
+            if (tagit == tagtable.end()) {
+                auto valtab = StringTools::create_set(1024);
+                tagtable[tag] = std::move(valtab);
+                tagit = tagtable.find(tag);
+            }
+            StringTools::SetT& valueset = tagit->second;
+            valueset.insert(val);
+            // next
+            p = skip_space(tag_end, end);
+        }
+    }
+};
+
 class Index : public IndexBase {
     StringPool pool_;
     StringTools::TableT table_;
     CMSketch metrics_names_;
     CMSketch tagvalue_pairs_;
+    SeriesNameTopology topology_;
 public:
     Index()
         : table_(StringTools::create_table(100000))
@@ -1432,6 +1560,7 @@ public:
         // Check if name is already been added
         auto name = std::make_pair((const char*)buffer, tags_end - buffer);
         if (table_.count(name) == 0) {
+            // insert value
             auto id = pool_.add(buffer, tags_end);
             if (id == 0) {
                 std::string line(begin, end);
@@ -1447,6 +1576,8 @@ public:
             }
             auto mhash = StringTools::hash(mname);
             metrics_names_.add(mhash, id);
+            // update topology
+            topology_.add_name(name);
         }
         return AKU_SUCCESS;
     }

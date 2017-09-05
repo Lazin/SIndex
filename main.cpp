@@ -13,6 +13,7 @@
 #include <vector>
 #include <random>
 #include <iterator>
+#include <sstream>
 
 #define BOOST_THROW_EXCEPTION(x) throw x;
 
@@ -201,6 +202,18 @@ aku_Status SeriesParser::to_normal_form(const char* begin, const char* end,
 //                       //
 
 typedef std::pair<const char*, u32> StringT;
+
+StringT tostrt(const char* p) {
+    return std::make_pair(p, strlen(p));
+}
+
+StringT tostrt(std::string const& s) {
+    return std::make_pair(s.data(), s.size());
+}
+
+std::string fromstrt(StringT s) {
+    return std::string(s.first, s.first + s.second);
+}
 
 class StringPool {
 public:
@@ -1304,6 +1317,9 @@ struct IndexBase {
     virtual ~IndexBase() = default;
     virtual IndexQueryResults tagvalue_query(TagValuePair const& value) const = 0;
     virtual IndexQueryResults metric_query(MetricName const& value) const = 0;
+    virtual std::vector<StringT> list_metric_names() const = 0;
+    virtual std::vector<StringT> list_tags(StringT metric) const = 0;
+    virtual std::vector<StringT> list_tag_values(StringT metric, StringT tag) const = 0;
 };
 
 class IndexQueryNodeBase {
@@ -1356,6 +1372,43 @@ IndexQueryResults IncludeTags::query(IndexBase const& index) const {
         results = results.intersection(res);
     }
     return results.filter(metric_).filter(pairs_);
+}
+
+/**
+ * Extracts only series that have specified tag-value
+ * combinations.
+ */
+struct IncludeIfHasTag : IndexQueryNodeBase {
+    constexpr static const char* node_name_ = "include-tags";
+    MetricName metric_;
+    StringT tagname_;
+
+    IncludeIfHasTag(MetricName const& metric, StringT tag_name)
+        : IndexQueryNodeBase(node_name_)
+        , metric_(metric)
+        , tagname_(tag_name)
+    {
+    }
+
+    virtual IndexQueryResults query(IndexBase const&) const;
+};
+
+IndexQueryResults IncludeIfHasTag::query(IndexBase const& index) const {
+    // Query available tag=value pairs first
+    std::vector<TagValuePair> pairs;
+    auto values = index.list_tag_values(metric_.get_value(), tagname_);
+    for (auto val: values) {
+        std::stringstream str;
+        str << fromstrt(tagname_) << '=' << fromstrt(val);
+        auto kv = str.str();
+        pairs.emplace_back(kv.c_str());
+    }
+    IndexQueryResults results = index.metric_query(metric_);
+    for(auto const& tv: pairs) {
+        auto res = index.tagvalue_query(tv);
+        results = results.intersection(res);
+    }
+    return results.filter(metric_).filter(pairs);
 }
 
 /**
@@ -1506,6 +1559,43 @@ public:
             p = skip_space(tag_end, end);
         }
     }
+
+    std::vector<StringT> list_metric_names() const {
+        std::vector<StringT> res;
+        std::transform(index_.begin(), index_.end(), std::back_inserter(res),
+                       [](std::pair<StringT, StringTools::L2TableT> const& v) {
+                            return v.first;
+                       });
+        return res;
+    }
+
+    std::vector<StringT> list_tags(StringT metric) const {
+        std::vector<StringT> res;
+        auto it = index_.find(metric);
+        if (it == index_.end()) {
+            return res;
+        }
+        std::transform(it->second.begin(), it->second.end(), std::back_inserter(res),
+                       [](std::pair<StringT, StringTools::SetT> const& v) {
+                            return v.first;
+                       });
+        return res;
+    }
+
+    std::vector<StringT> list_tag_values(StringT metric, StringT tag) const {
+        std::vector<StringT> res;
+        auto it = index_.find(metric);
+        if (it == index_.end()) {
+            return res;
+        }
+        auto vit = it->second.find(tag);
+        if (vit == it->second.end()) {
+            return res;
+        }
+        const auto& set = vit->second;
+        std::copy(set.begin(), set.end(), std::back_inserter(res));
+        return res;
+    }
 };
 
 class Index : public IndexBase {
@@ -1520,6 +1610,10 @@ public:
         , metrics_names_(3, 1024)
         , tagvalue_pairs_(3, 1024)
     {
+    }
+
+    SeriesNameTopology const& get_topology() const {
+        return topology_;
     }
 
     size_t cardinality() const {
@@ -1593,6 +1687,18 @@ public:
         auto post = metrics_names_.extract(hash);
         return IndexQueryResults(std::move(post), &pool_);
     }
+
+    virtual std::vector<StringT> list_metric_names() const {
+        return topology_.list_metric_names();
+    }
+
+    virtual std::vector<StringT> list_tags(StringT metric) const {
+        return topology_.list_tags(metric);
+    }
+
+    virtual std::vector<StringT> list_tag_values(StringT metric, StringT tag) const {
+        return topology_.list_tag_values(metric, tag);
+    }
 };
 
 int main(int argc, char *argv[])
@@ -1623,5 +1729,7 @@ int main(int argc, char *argv[])
         auto sname = *it;
         std::cout << "Name found: " << std::string(sname.first, sname.first + sname.second) << std::endl;
     }
+    auto values = index.get_topology().list_tag_values(tostrt("cpu.user"), tostrt("host"));
+    std::cout << "found " << values.size() << " values" << std::endl;
     return 0;
 }

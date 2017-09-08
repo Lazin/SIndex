@@ -412,79 +412,6 @@ StringTools::SetT StringTools::create_set(size_t size) {
     return SetT(size, &StringTools::hash, &StringTools::equal);
 }
 
-//                  //
-//  Hash-fn family  //
-//                  //
-
-//! Family of 4-universal hash functions
-struct HashFnFamily {
-    const u32 N;
-    const u32 K;
-    //! Tabulation based hash fn used, N tables should be generated using RNG in c-tor
-    std::vector<std::vector<unsigned short>> table_;
-
-    //! C-tor. N - number of different hash functions, K - number of values (should be a power of two)
-    HashFnFamily(u32 N, u32 K);
-
-    //! Calculate hash value in range [0, K)
-    u32 hash(int ix, u64 key) const;
-
-private:
-    u32 hash32(int ix, u32 key) const;
-};
-
-static u32 combine(u32 hi, u32 lo) {
-    return (u32)(2 - (int)hi + (int)lo);
-}
-
-HashFnFamily::HashFnFamily(u32 N, u32 K)
-    : N(N)
-    , K(K)
-{
-    // N should be odd
-    if (N % 2 == 0) {
-        std::runtime_error err("invalid argument N (should be odd)");
-        BOOST_THROW_EXCEPTION(err);
-    }
-    // K should be a power of two
-    auto mask = K-1;
-    if ((mask&K) != 0) {
-        std::runtime_error err("invalid argument K (should be a power of two)");
-        BOOST_THROW_EXCEPTION(err);
-    }
-    // Generate tables
-    std::random_device randdev;
-    std::mt19937 generator(randdev());
-    std::uniform_int_distribution<> distribution;
-    for (u32 i = 0; i < N; i++) {
-        std::vector<unsigned short> col;
-        auto mask = K-1;
-        for (int j = 0; j < 0x10000; j++) {
-            int value = distribution(generator);
-            col.push_back((u32)mask&value);
-        }
-        table_.push_back(col);
-    }
-}
-
-u32 HashFnFamily::hash(int ix, u64 key) const {
-    auto hi32 = key >> 32;
-    auto lo32 = key & 0xFFFFFFFF;
-    auto hilo = combine(hi32, lo32);
-
-    auto hi32hash = hash32(ix, hi32);
-    auto lo32hash = hash32(ix, lo32);
-    auto hilohash = hash32(ix, hilo);
-
-    return hi32hash ^ lo32hash ^ hilohash;
-}
-
-u32 HashFnFamily::hash32(int ix, u32 key) const {
-    auto hi16 = key >> 16;
-    auto lo16 = key & 0xFFFF;
-    auto hilo = combine(hi16, lo16) & 0xFFFF;
-    return table_[ix][lo16] ^ table_[ix][hi16] ^ table_[ix][hilo];
-}
 
 //             //
 //  CM-sketch  //
@@ -909,34 +836,41 @@ public:
     }
 };
 
+i64 log2i64(i64 value) {
+    return static_cast<i64>(8*sizeof(u64) - __builtin_clzll((u64)value) - 1);
+}
+
 class CMSketch {
     //typedef Roaring TVal;
     //typedef PList TVal;
     typedef CompressedPList TVal;
     std::vector<std::vector<TVal>> table_;
-    HashFnFamily hashfn_;
     const u32 N;
     const u32 M;
+    const u32 mask_;
+    const u32 bits_;
+
+    u32 extracthash(u64 key, u32 i) const {
+        u32 hash = (key >> (i * bits_)) & mask_;
+        return hash;
+    }
 public:
-    CMSketch(u32 N, u32 M) : hashfn_(N, M), N(N), M(M) {
+    CMSketch(u32 M) : N(3), M(M), mask_(M-1), bits_(static_cast<u32>(log2i64(mask_))) {
+        // M should be a power of two
+        if ((mask_&M) != 0) {
+            std::runtime_error err("invalid argument K (should be a power of two)");
+            throw err;
+        }
         table_.resize(N);
         for (auto& row: table_) {
             row.resize(M);
         }
     }
 
-    void add(u64 value) {
-        for (u32 i = 0; i < N; i++) {
-            // calculate hash from id to K
-            u32 hash = hashfn_.hash(i, value);
-            table_[i][hash].add((u32)value);
-        }
-    }
-
     void add(u64 key, u64 value) {
         for (u32 i = 0; i < N; i++) {
             // calculate hash from id to K
-            u32 hash = hashfn_.hash(i, key);
+            u32 hash = extracthash(key, i);
             table_[i][hash].add(value);
         }
     }
@@ -955,7 +889,7 @@ public:
         std::vector<const TVal*> inputs;
         for (u32 i = 0; i < N; i++) {
             // calculate hash from id to K
-            u32 hash = hashfn_.hash(i, value);
+            u32 hash = extracthash(value, i);
             inputs.push_back(&table_[i][hash]);
         }
         return *inputs[0] & *inputs[1] & *inputs[2];
@@ -1607,8 +1541,8 @@ class Index : public IndexBase {
 public:
     Index()
         : table_(StringTools::create_table(100000))
-        , metrics_names_(3, 1024)
-        , tagvalue_pairs_(3, 1024)
+        , metrics_names_(1024)
+        , tagvalue_pairs_(1024)
     {
     }
 

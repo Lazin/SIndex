@@ -855,7 +855,7 @@ class CMSketch {
         return hash;
     }
 public:
-    CMSketch(u32 M) : N(3), M(M), mask_(M-1), bits_(static_cast<u32>(log2i64(mask_))) {
+    CMSketch(u32 M) : N(2), M(M), mask_(M-1), bits_(static_cast<u32>(log2i64(mask_))) {
         // M should be a power of two
         if ((mask_&M) != 0) {
             std::runtime_error err("invalid argument K (should be a power of two)");
@@ -892,7 +892,32 @@ public:
             u32 hash = extracthash(value, i);
             inputs.push_back(&table_[i][hash]);
         }
-        return *inputs[0] & *inputs[1] & *inputs[2];
+        return *inputs[0] & *inputs[1];// & *inputs[2];
+    }
+};
+
+class InvertedIndex {
+    typedef CompressedPList TVal;
+    std::unordered_map<u64, TVal> table_;
+public:
+    InvertedIndex(u32) {
+    }
+
+    void add(u64 key, u64 value) {
+        table_[key].add(value);
+    }
+
+    size_t get_size_in_bytes() const {
+        size_t sum = 0;
+        for (auto const& row: table_) {
+            auto const& list = row.second;
+            sum += list.getSizeInBytes();
+        }
+        return sum;
+    }
+
+    TVal extract(u64 value) const {
+        return table_.find(value)->second;
     }
 };
 
@@ -972,7 +997,8 @@ double PerfTimer::elapsed() const {
            double(curr.tv_nsec - _start_time.tv_nsec)/1000000000.0;
 }
 
-static void write_tags(const char* begin, const char* end, CMSketch* dest_sketch, u64 id) {
+template <class Table>
+void write_tags(const char* begin, const char* end, Table* dest_sketch, u64 id) {
     const char* tag_begin = begin;
     const char* tag_end = begin;
     bool err = false;
@@ -1535,14 +1561,16 @@ public:
 class Index : public IndexBase {
     StringPool pool_;
     StringTools::TableT table_;
-    CMSketch metrics_names_;
-    CMSketch tagvalue_pairs_;
+    //CMSketch metrics_names_;
+    InvertedIndex metrics_names_;
+    //CMSketch tagvalue_pairs_;
+    InvertedIndex tagvalue_pairs_;
     SeriesNameTopology topology_;
 public:
     Index()
         : table_(StringTools::create_table(100000))
-        , metrics_names_(1024)
-        , tagvalue_pairs_(1024)
+        , metrics_names_(512)//1024)
+        , tagvalue_pairs_(512)//1024)
     {
     }
 
@@ -1605,7 +1633,7 @@ public:
             auto mhash = StringTools::hash(mname);
             metrics_names_.add(mhash, id);
             // update topology
-            topology_.add_name(name);
+            //topology_.add_name(name);
         }
         return AKU_SUCCESS;
     }
